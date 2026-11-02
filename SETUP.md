@@ -24,7 +24,9 @@ command -v lark-cli
 grep -l -E 'id: dsh-superagent\b' "${DSH_HOME:-$HOME/.dsh}"/profiles/*/cordis.patch.yml 2>/dev/null
 ```
 
-- **Prerequisites:** Node.js 22.19+ or 24+, pnpm, git 2.32+, tmux, Python 3.8+, GitHub CLI 2.48+, and DSH within the `engines.dsh` range of `package.json`. A missing one becomes an item of the plan, not a question. DSH also needs a model provider; if the operator has never run DSH with a model, configuring one is an operator step.
+On Windows, run the checks with `python --version` and skip `tmux -V`, which it does not need.
+
+- **Prerequisites:** Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+, GitHub CLI 2.48+, and DSH within the `engines.dsh` range of `package.json`; tmux is needed on macOS and Linux, where the service script runs the service in a tmux session, and Windows runs it as a detached process instead. A missing one becomes an item of the plan, not a question. DSH also needs a model provider; if the operator has never run DSH with a model, configuring one is an operator step.
 - **Operator login:** the `gh api user` result is the operator's own GitHub login, used as the recommendation in question 5.
 - **Existing profile:** a profile with a `dsh-superagent` entry is an earlier setup: ask whether to continue it, keep its configuration, and read Upgrade in `docs/006-deployment.md`.
 

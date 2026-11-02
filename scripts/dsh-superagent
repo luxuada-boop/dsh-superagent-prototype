@@ -4,10 +4,16 @@
 `status`, `start`, and `restart` exit 0 while the service runs normally; 1 when it is stopped, duplicated, unreachable, or
 reporting a runtime error, which `restart` may fix; 2 when it runs while a component such as a Source reports an error;
 and 3 when it runs and waits for setup. A restart fixes neither 2 nor 3: they need a person.
+
+Windows has neither tmux nor `ps`, so `start` runs `dsh` as a detached process with its own hidden console and process
+group, and records that launcher PID in `service.pid` (for a `.cmd`/`.bat` shim it is `cmd.exe`, not node). Discovery
+trusts `service.pid` while that PID serves the profile and otherwise enumerates `Win32_Process` through PowerShell.
+`stop` sends CTRL_BREAK to the service's console, which Node reports as SIGBREAK rather than the SIGINT used on macOS
+and Linux; if the process has no console to signal, it force-stops the process tree with `taskkill /T /F` and says so on
+stderr. POSIX never force-kills.
 """
 
 import argparse
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -21,10 +27,20 @@ import time
 import urllib.error
 import urllib.request
 
+if sys.platform == 'win32':
+    import ctypes
+    import msvcrt
+else:
+    import fcntl
+
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / '.artifacts'
 CONTROL = ARTIFACTS / 'control'
 KEEP_LOGS = 20
+WINDOWS = sys.platform == 'win32'
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_NO_WINDOW = 0x08000000
+CTRL_BREAK_EVENT = 1
 
 
 def control(profile):
@@ -63,13 +79,48 @@ def ps(*options, check=False):
             yield int(parts[0]), parts[1], parts[2].split()
 
 
+def windows_ps(pid=None):
+    """Yield `(pid, name, args)` tuples from `Win32_Process` through PowerShell, for one PID or for every process."""
+    shell = shutil.which('powershell') or shutil.which('pwsh')
+    if not shell:
+        raise RuntimeError('PowerShell is required to inspect processes on Windows.')
+    condition = f' -Filter "ProcessId = {int(pid)}"' if pid is not None else ''
+    script = ('$p = @(Get-CimInstance Win32_Process' + condition
+              + ' | Select-Object ProcessId, Name, CommandLine); ConvertTo-Json -InputObject $p -Compress')
+    result = subprocess.run([shell, '-NoProfile', '-NonInteractive', '-Command', script],
+                            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+    # A failed lookup is not an empty process list; callers must not mistake it for a stopped service.
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, [shell], result.stdout, result.stderr)
+    try:
+        rows = json.loads(result.stdout or '[]')
+    except ValueError:
+        rows = []
+    for row in rows:
+        command = row.get('CommandLine') or ''
+        yield int(row['ProcessId']), (row.get('Name') or ''), command.split()
+
+
 def running(pid, profile):
     """Return whether `pid` is currently running the DSH service for `profile` (`ps -p` returns nothing once exited)."""
+    if WINDOWS:
+        # A `.cmd` shim runs as `cmd.exe` and a native install as `dsh.exe`, so the command line, not the image name, decides.
+        return any(found == pid and serves(args, profile) for found, _, args in windows_ps(pid))
     return any(found == pid and name in ('node', 'dsh') and serves(args, profile) for found, name, args in ps('-p', str(pid)))
 
 
 def processes(profile):
     """Return PIDs of all running DSH service processes for `profile`, including instances started outside this script and the recorded `service.pid` while still running."""
+    if WINDOWS:
+        # Prefer the recorded launcher: its descendants repeat `--profile`, and counting both would look like a duplicate.
+        try:
+            recorded = int((control(profile) / 'service.pid').read_text())
+        except (OSError, ValueError):
+            recorded = None
+        if recorded is not None and running(recorded, profile):
+            return [recorded]
+        names = ('node', 'node.exe', 'dsh', 'dsh.exe')
+        return [pid for pid, name, args in windows_ps() if name.lower() in names and serves(args, profile)]
     found = [pid for pid, name, args in ps('-ax', check=True) if name in ('node', 'dsh') and serves(args, profile)]
     try:
         pid = int((control(profile) / 'service.pid').read_text())
@@ -129,6 +180,36 @@ def status(args):
     return outcome(pids, current)
 
 
+def interrupt(pid):
+    """Ask `pid` to shut down: SIGINT on POSIX, or CTRL_BREAK on the process's console on Windows."""
+    if not WINDOWS:
+        os.kill(pid, signal.SIGINT)
+        return
+    kernel32 = ctypes.windll.kernel32
+    attached = (ctypes.c_uint32 * 256)()
+    count = kernel32.GetConsoleProcessList(attached, 256)
+    # Sharing our console, signal only the child's process group, never the processes around it.
+    if pid in set(attached[:count]) and kernel32.GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid):
+        return
+    # Otherwise a short-lived helper attaches to the service's own hidden console and signals everyone on it. Doing this
+    # in a helper keeps this process on its console, so its own pipes and later subprocesses keep working.
+    helper = ("import ctypes, sys, time\n"
+              "kernel32 = ctypes.windll.kernel32\n"
+              "kernel32.FreeConsole()\n"
+              "if not kernel32.AttachConsole(int(sys.argv[1])):\n"
+              "    sys.exit(2)\n"
+              "kernel32.SetConsoleCtrlHandler(None, True)\n"
+              "sys.exit(0 if kernel32.GenerateConsoleCtrlEvent(1, 0) else 3)\n")
+    result = subprocess.run([sys.executable, '-c', helper, str(pid)], stdin=subprocess.DEVNULL,
+                            capture_output=True, creationflags=CREATE_NO_WINDOW)
+    # The helper may die from the CTRL_BREAK it delivered (a console control event is not maskable the way SIGINT is),
+    # which still means the service received it; 0xC000013A is STATUS_CONTROL_C_EXIT.
+    if result.returncode in (0, 0xC000013A, -1073741510):
+        return
+    print('No console accepts a graceful signal; force-stopping with taskkill /T.', file=sys.stderr)
+    subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], check=True, capture_output=True)
+
+
 def stop(args, intentional=True):
     """Stop the service gracefully, recording a manual stop marker when `intentional` is True."""
     pids = processes(args.profile)
@@ -138,7 +219,7 @@ def stop(args, intentional=True):
     if intentional:
         (control(args.profile) / 'manually-stopped').write_text(time.strftime('%Y-%m-%dT%H:%M:%S%z') + '\n')
     for pid in pids:
-        os.kill(pid, signal.SIGINT)
+        interrupt(pid)
     deadline = time.monotonic() + args.stop_timeout
     while any(running(pid, args.profile) for pid in pids):
         if time.monotonic() >= deadline:
@@ -163,26 +244,44 @@ def start(args):
         raise RuntimeError('Multiple dsh-superagent processes found; refusing to start another.')
     if not pids:
         dsh = shutil.which('dsh')
-        if not dsh or not shutil.which('tmux'):
-            raise RuntimeError('Both dsh and tmux must be on PATH.')
-        exists = subprocess.run(['tmux', 'has-session', '-t', '=' + session],
-                                capture_output=True).returncode == 0
-        if state(args.url) is not None:
-            raise RuntimeError('An existing orchestrator answers at this URL; refusing duplicate startup.')
-        stamp = time.strftime('%Y%m%d-%H%M%S')
-        log = ARTIFACTS / f'dsh-superagent-{args.profile}-{stamp}-{os.getpid()}.log'
-        log.touch()
-        prune_logs(args.profile)
-        # `exec` replaces the shell so the pane PID printed by tmux is the DSH service process itself.
-        command = ('umask 077; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open'])
-                   + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
-        # Reuse an existing tmux session without disturbing other windows.
-        target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]
-        pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server', '-c', str(ROOT), command],
-                              check=True, capture_output=True, text=True).stdout.strip()
-        if pane.isdigit():
-            (control(args.profile) / 'service.pid').write_text(pane + '\n')
-        print('Log: ' + str(log), flush=True)
+        if WINDOWS:
+            if not dsh:
+                raise RuntimeError('dsh must be on PATH.')
+            if state(args.url) is not None:
+                raise RuntimeError('An existing orchestrator answers at this URL; refusing duplicate startup.')
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            log = ARTIFACTS / f'dsh-superagent-{args.profile}-{stamp}-{os.getpid()}.log'
+            log.touch()
+            prune_logs(args.profile)
+            # A hidden console without a window keeps the service signalable by CTRL_BREAK but invisible.
+            with log.open('ab') as output:
+                child = subprocess.Popen([dsh, '--profile', args.profile, '--no-open'], cwd=str(ROOT),
+                                         stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                         creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+            if child.pid:
+                (control(args.profile) / 'service.pid').write_text(f'{child.pid}\n')
+            print('Log: ' + str(log), flush=True)
+        else:
+            if not dsh or not shutil.which('tmux'):
+                raise RuntimeError('Both dsh and tmux must be on PATH.')
+            exists = subprocess.run(['tmux', 'has-session', '-t', '=' + session],
+                                    capture_output=True).returncode == 0
+            if state(args.url) is not None:
+                raise RuntimeError('An existing orchestrator answers at this URL; refusing duplicate startup.')
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            log = ARTIFACTS / f'dsh-superagent-{args.profile}-{stamp}-{os.getpid()}.log'
+            log.touch()
+            prune_logs(args.profile)
+            # `exec` replaces the shell so the pane PID printed by tmux is the DSH service process itself.
+            command = ('umask 077; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open'])
+                       + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
+            # Reuse an existing tmux session without disturbing other windows.
+            target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]
+            pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server', '-c', str(ROOT), command],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+            if pane.isdigit():
+                (control(args.profile) / 'service.pid').write_text(pane + '\n')
+            print('Log: ' + str(log), flush=True)
     else:
         (control(args.profile) / 'service.pid').write_text(f'{pids[0]}\n')
         print(f'dsh-superagent already running (PID {pids[0]}); no duplicate started.', flush=True)
@@ -206,6 +305,20 @@ def start(args):
     raise RuntimeError('Startup health check timed out; inspect the log. Any running process was left intact.')
 
 
+def lock(handle):
+    """Take the exclusive non-blocking lock on `handle`, or report that another operation holds it."""
+    if WINDOWS:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            raise RuntimeError('Another dsh-superagent control operation is in progress.') from None
+    else:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another dsh-superagent control operation is in progress.') from None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['start', 'stop', 'restart', 'status'])
@@ -223,12 +336,10 @@ def main():
         parser.error('--timeout and --stop-timeout must be positive')
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', args.profile):
         parser.error('--profile must be a DSH profile name')
-    os.umask(0o077)
-    with (control(args.profile) / 'operation.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError('Another dsh-superagent control operation is in progress.') from None
+    if not WINDOWS:
+        os.umask(0o077)
+    with (control(args.profile) / 'operation.lock').open('a') as lock_file:
+        lock(lock_file)
         if args.respect_stop and args.action in ('start', 'restart') and stopped(args.profile):
             print('Intentional stop is active; automatic recovery skipped.')
             return 0

@@ -1026,7 +1026,9 @@ it('reports GitHub as failing only after the configured number of consecutive fa
   expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, observeIssues: false,
     observePulls: false, observeComments: false, observeCi: false })
 })
-describe('feishu event consumer', () => {
+// The consumer starts the bot CLI with `spawn`, and the stand-in here is a `#!/bin/sh` script, which Windows cannot start
+// and cannot replace with a batch file either (`CreateProcess` runs neither without a shell). A native `lark-cli` is unaffected.
+describe.skipIf(process.platform === 'win32')('feishu event consumer', () => {
   let dir: string
   let controller: AbortController
   let running: Promise<unknown> | undefined
